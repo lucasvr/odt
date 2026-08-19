@@ -6,13 +6,63 @@ use crate::label::{LabelMap, LabelResolver};
 use crate::parse::rules::*;
 use crate::parse::{SpanExt, TypedRuleExt, parse_quoted_string};
 use crate::path::NodePath;
-use crate::{Arena, BinaryNode, SourceNode};
+use crate::{Arena, BinaryNode, SourceNode, TypedNode};
 use core::str::CharIndices;
 use hashlink::{LinkedHashMap, LinkedHashSet};
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::cell::RefCell;
+
+/// One evaluated component of a property value.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TypedValue {
+    /// An integer cell, truncated to the `/bits/` width of its cell block.
+    Cell { bits: u8, value: u64 },
+    /// A floating point cell.
+    Float { bits: u8, value: f64 },
+    /// A node reference inside a cell block (`<&label>`), resolved to the
+    /// target path and its assigned phandle.
+    Phandle { path: NodePath, phandle: u32 },
+    /// A node reference in string context (`&label`).
+    Reference(NodePath),
+    /// A quoted string
+    String(String),
+    /// Raw bytes with no further structure.
+    Bytes(Vec<u8>),
+    /// An `/incbin/` directive: the referenced file and its contents.
+    Incbin { path: PathBuf, data: Vec<u8> },
+}
+
+/// Serializes evaluated values to the flat byte string the property occupies
+/// in a DTB.
+pub fn to_bytes(values: &[TypedValue]) -> Vec<u8> {
+    let mut r = vec![];
+    for value in values {
+        match value {
+            TypedValue::Cell { bits, value } => match bits {
+                8 => r.push(*value as u8),
+                16 => r.extend((*value as u16).to_be_bytes()),
+                32 => r.extend((*value as u32).to_be_bytes()),
+                _ => r.extend(value.to_be_bytes()),
+            },
+            TypedValue::Float { bits: 32, value } => r.extend((*value as f32).to_be_bytes()),
+            TypedValue::Float { value, .. } => r.extend(value.to_be_bytes()),
+            TypedValue::Phandle { phandle, .. } => r.extend(phandle.to_be_bytes()),
+            TypedValue::Reference(path) => {
+                r.extend(path.display().as_bytes());
+                r.push(0);
+            }
+            TypedValue::String(s) => {
+                r.extend(s.as_bytes());
+                r.push(0);
+            }
+            TypedValue::Bytes(bytes) => r.extend(bytes),
+            TypedValue::Incbin { data, .. } => r.extend(data),
+        }
+    }
+    r
+}
 
 /// Assigns phandles and evaluates expressions.
 /// Call with the output of `crate::merge::merge()` or `resolve_incbin_paths()`.
@@ -22,6 +72,19 @@ pub fn eval(
     loader: &impl Loader,
     scribe: &mut Scribe,
 ) -> BinaryNode {
+    eval_typed(tree, node_labels, loader, scribe).map_values(&mut |values| to_bytes(&values))
+}
+
+/// Assigns phandles and evaluates expressions, like [`eval`], but keeps each
+/// property value as a list of [`TypedValue`]s rather than serializing it to
+/// a flat byte string.
+/// Call with the output of `crate::merge::merge()` or `resolve_incbin_paths()`.
+pub fn eval_typed(
+    tree: SourceNode,
+    node_labels: LabelMap,
+    loader: &impl Loader,
+    scribe: &mut Scribe,
+) -> TypedNode {
     let phandles = assign_phandles(&tree, &node_labels, scribe);
     let read_file = |path: &Path| match loader.read(path.to_owned()) {
         Some((_, data)) => Ok(data.to_vec()),
@@ -32,9 +95,13 @@ pub fn eval(
     let mut tree = evaluate_expressions(tree, &node_labels, &phandles, read_file, scribe);
     // poke assigned phandle values into the final tree
     for (path, phandle) in phandles {
-        tree.walk_mut(path.segments())
-            .unwrap()
-            .set_property("phandle", phandle.to_be_bytes().into());
+        tree.walk_mut(path.segments()).unwrap().set_property(
+            "phandle",
+            vec![TypedValue::Cell {
+                bits: 32,
+                value: phandle as u64,
+            }],
+        );
     }
     tree
 }
@@ -215,17 +282,17 @@ fn node_phandle<P>(
             Err(propvalue.err("phandle expression cannot reference another phandle"))
         } else {
             phandle_is_self_reference.set(true);
-            Ok(0)
+            Ok((path.clone(), 0))
         }
     };
-    let phandle = evaluate_propvalue(
+    let phandle = to_bytes(&evaluate_propvalue(
         propvalue,
         |_| Err(propvalue.err("phandle expression cannot use a string node reference")),
         lookup_phandle,
         |_| Err(propvalue.err("phandle expression cannot use property references")),
         // dtc allows this, but there's no need for it.
         |_| Err(propvalue.err("phandle expression cannot use /incbin/")),
-    )?;
+    )?);
     let n = phandle.len();
     if n != 4 {
         return Err(propvalue.err(format!("phandles must be u32, got {n} bytes")));
@@ -281,7 +348,11 @@ fn eval_property_reference(
 
     // Reuse the lookup rules from `evaluate_expressions`
     let lookup_label = |nr: &NodeReference| labels.resolve(&nodepath, nr);
-    let lookup_phandle = |nr: &NodeReference| Ok(*phandles.get(&labels.resolve(&nodepath, nr)?).unwrap());
+    let lookup_phandle = |nr: &NodeReference| {
+        let target = labels.resolve(&nodepath, nr)?;
+        let phandle = *phandles.get(&target).unwrap();
+        Ok((target, phandle))
+    };
     let lookup_property = |pr: &PropertyReference| {
         // Recurse to resolve nested property references
         eval_property_reference(&nodepath, labels, phandles, read_file, pr, visited)
@@ -298,7 +369,7 @@ fn eval_property_reference(
     // Remove the visited key from the set now that we're done evaluating it
     visited.borrow_mut().remove(&key);
 
-    result
+    result.map(|values| to_bytes(&values))
 }
 
 fn evaluate_expressions(
@@ -307,7 +378,7 @@ fn evaluate_expressions(
     phandles: &PhandleMap,
     read_file: impl Fn(&Path) -> Result<Vec<u8>, SourceError>,
     scribe: &mut Scribe,
-) -> BinaryNode {
+) -> TypedNode {
     let old = root.clone();
     let labels = &LabelResolver(node_labels, &old);
     let read_file = |p: &Path| read_file(p);
@@ -316,7 +387,9 @@ fn evaluate_expressions(
         Some(propvalue) => {
             let lookup_label = |noderef: &NodeReference| labels.resolve(loc, noderef);
             let lookup_phandle = |noderef: &NodeReference| {
-                Ok(*phandles.get(&labels.resolve(loc, noderef)?).unwrap())
+                let target = labels.resolve(loc, noderef)?;
+                let phandle = *phandles.get(&target).unwrap();
+                Ok((target, phandle))
             };
             let lookup_prop = |propref: &PropertyReference| {
                 eval_property_reference(loc, labels, phandles, &read_file, propref, &RefCell::new(HashSet::new()))
@@ -331,9 +404,9 @@ fn evaluate_expressions(
                 Ok(v) => v,
                 Err(e) => {
                     scribe.err(e);
-                    // TODO:  Consider returning `node::Node<Result<Vec<u8>, SourceError>>`
+                    // TODO:  Consider returning `node::Node<Result<Vec<TypedValue>, SourceError>>`
                     // instead of this in-band signaling.
-                    b"<ERROR>\0".to_vec()
+                    vec![TypedValue::Bytes(b"<ERROR>\0".to_vec())]
                 }
             }
         }
@@ -346,21 +419,21 @@ fn evaluate_expressions(
 fn evaluate_propvalue(
     propvalue: &PropValue,
     lookup_label: impl Fn(&NodeReference) -> Result<NodePath, SourceError>,
-    lookup_phandle: impl Fn(&NodeReference) -> Result<u32, SourceError>,
+    lookup_phandle: impl Fn(&NodeReference) -> Result<(NodePath, u32), SourceError>,
     lookup_property_fn: impl Fn(&PropertyReference) -> Result<Vec<u8>, SourceError>,
     read_file: impl Fn(&Path) -> Result<Vec<u8>, SourceError>,
-) -> Result<Vec<u8>, SourceError> {
+) -> Result<Vec<TypedValue>, SourceError> {
     let mut r = vec![];
     let lookup_property = Some(&lookup_property_fn);
     for labeled_value in propvalue.labeled_value {
         match labeled_value.value {
             Value::Cells(cells) => {
                 let bits = match cells.bits {
-                    None => 32,
+                    None => 32u8,
                     Some(bits) => {
                         let n = bits.numeric_literal.eval(lookup_property)?;
                         match n {
-                            8 | 16 | 32 | 64 => n,
+                            8 | 16 | 32 | 64 => n as u8,
                             _ => return Err(bits.err("bad bit width: must be 8, 16, 32, or 64")),
                         }
                     }
@@ -371,11 +444,12 @@ fn evaluate_propvalue(
                     };
                     let n = match cell {
                         Cell::NodeReference(noderef) => {
-                            let phandle = lookup_phandle(noderef)?;
+                            let (path, phandle) = lookup_phandle(noderef)?;
                             if bits != 32 {
                                 return Err(noderef.err("phandle references need /bits/ == 32"));
                             }
-                            phandle as u64
+                            r.push(TypedValue::Phandle { path, phandle });
+                            continue;
                         }
                         Cell::PropertyReference(propref) => {
                             let bytes = lookup_property_fn(propref)?;
@@ -401,16 +475,18 @@ fn evaluate_propvalue(
                                 .parse()
                                 .map_err(|_| lit.err("bad float literal"))?;
                             // IEEE 754 bit patterns must not go through the
-                            // sign-extension check below.
-                            match bits {
-                                32 => r.extend((v as f32).to_be_bytes()),
-                                64 => r.extend(v.to_be_bytes()),
+                            // sign-extension check below.  A binary32 value is
+                            // stored pre-rounded so it matches the serialized form.
+                            let value = match bits {
+                                32 => (v as f32) as f64,
+                                64 => v,
                                 _ => {
                                     return Err(
                                         lit.err("float literals need /bits/ == 32 or 64")
                                     );
                                 }
-                            }
+                            };
+                            r.push(TypedValue::Float { bits, value });
                             continue;
                         }
                         Cell::ParenExpr(expr) => expr.eval(lookup_property)?,
@@ -430,37 +506,45 @@ fn evaluate_propvalue(
                             eprintln!("Truncating value {n:#x} to {trunc:#0tchars$x}:\n{err}");
                         }
                     }
-                    match bits {
-                        8 => r.push(n as u8),
-                        16 => r.extend((n as u16).to_be_bytes()),
-                        32 => r.extend((n as u32).to_be_bytes()),
-                        64 => r.extend(n.to_be_bytes()),
+                    let value = match bits {
+                        8 => n as u8 as u64,
+                        16 => n as u16 as u64,
+                        32 => n as u32 as u64,
+                        64 => n,
                         _ => unreachable!(),
-                    }
+                    };
+                    r.push(TypedValue::Cell { bits, value });
                 }
             }
             Value::QuotedString(quotedstring) => {
                 let bytes = quotedstring.unescape()?;
-                r.extend(&*bytes);
-                r.push(0);
+                match core::str::from_utf8(&bytes) {
+                    Ok(s) => r.push(TypedValue::String(s.to_string())),
+                    Err(_) => {
+                        // Escape sequences may produce arbitrary bytes; keep the
+                        // NUL terminator with them.
+                        let mut bytes = bytes.into_owned();
+                        bytes.push(0);
+                        r.push(TypedValue::Bytes(bytes));
+                    }
+                }
             }
             Value::NodeReference(noderef) => {
-                let target = lookup_label(noderef)?;
-                r.extend(target.display().as_bytes());
-                r.push(0);
+                r.push(TypedValue::Reference(lookup_label(noderef)?));
             }
             Value::PropertyReference(propref) => {
-                let prop = lookup_property_fn(propref)?;
-                r.extend(prop);
+                r.push(TypedValue::Bytes(lookup_property_fn(propref)?));
             }
             Value::ByteString(bytestring) => {
+                let mut bytes = vec![];
                 for label_or_hex_byte in bytestring.label_or_hex_byte {
                     if let LabelOrHexByte::HexByte(hex_byte) = label_or_hex_byte {
                         let s = hex_byte.str();
                         let b = u8::from_str_radix(s, 16).unwrap(); // parser has already validated
-                        r.push(b);
+                        bytes.push(b);
                     }
                 }
+                r.push(TypedValue::Bytes(bytes));
             }
             Value::Incbin(incbin) => {
                 if !incbin.incbin_args.numeric_literal.is_empty() {
@@ -469,12 +553,8 @@ fn evaluate_propvalue(
                 let path_bytes = incbin.incbin_args.quoted_string.unescape()?;
                 let path = path_from_bytes(&path_bytes);
                 // TODO:  This may repeat an error already reported by `resolve_incbin_paths()`.
-                let bin = read_file(&path)?;
-                if r.is_empty() {
-                    r = bin;
-                } else {
-                    r.extend(bin);
-                }
+                let data = read_file(&path)?;
+                r.push(TypedValue::Incbin { path, data });
             }
         }
     }
@@ -772,6 +852,126 @@ fn test_property_reference_cycles() {
         _ = eval(tree, node_labels, &loader, &mut scribe);
         let err = scribe.collect().err().unwrap();
         assert!(err.to_string().contains("property reference cycle detected"));
+    }
+}
+
+#[test]
+fn test_eval_typed() {
+    let source = r#"
+/dts-v1/;
+/ {
+    target: node@1 {
+        reg = <1>;
+    };
+    check {
+        cells = <1 0x2 'A' (2 + 3)>;
+        wide = /bits/ 64 <0x123456789>;
+        narrow = /bits/ 8 <1 2 255>;
+        float32 = <2.5>;
+        float64 = /bits/ 64 <-0.5>;
+        phandle_ref = <&target>;
+        path_ref = &target;
+        strings = "hello", "world";
+        bytes = [de ad be ef];
+        spliced = ${/check/strings};
+        mixed = <42>, "str", [00];
+        empty;
+    };
+}; "#;
+    let loader = crate::fs::DummyLoader;
+    let arena = crate::Arena::new();
+    let dts = crate::parse::parse_typed(source, &arena).unwrap();
+    let mut scribe = Scribe::new(true);
+    let (tree, node_labels) = crate::merge::merge(dts, &mut scribe);
+    let typed = eval_typed(tree, node_labels, &loader, &mut scribe);
+    assert!(scribe.report(&loader, &mut std::io::stderr()));
+
+    let target_path = NodePath::root().join("node@1");
+    let check = typed.get_child("check").unwrap();
+    let prop = |name: &str| check.get_property(name).unwrap();
+    let cell = |value| TypedValue::Cell { bits: 32, value };
+
+    assert_eq!(prop("cells"), &[cell(1), cell(2), cell(b'A' as u64), cell(5)]);
+    assert_eq!(
+        prop("wide"),
+        &[TypedValue::Cell {
+            bits: 64,
+            value: 0x123456789,
+        }]
+    );
+    assert_eq!(
+        prop("narrow"),
+        &(1..=2)
+            .chain(Some(255))
+            .map(|value| TypedValue::Cell { bits: 8, value })
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        prop("float32"),
+        &[TypedValue::Float {
+            bits: 32,
+            value: 2.5,
+        }]
+    );
+    assert_eq!(
+        prop("float64"),
+        &[TypedValue::Float {
+            bits: 64,
+            value: -0.5,
+        }]
+    );
+    assert_eq!(
+        prop("phandle_ref"),
+        &[TypedValue::Phandle {
+            path: target_path.clone(),
+            phandle: 1,
+        }]
+    );
+    assert_eq!(prop("path_ref"), &[TypedValue::Reference(target_path)]);
+    assert_eq!(
+        prop("strings"),
+        &[
+            TypedValue::String("hello".into()),
+            TypedValue::String("world".into()),
+        ]
+    );
+    assert_eq!(
+        prop("bytes"),
+        &[TypedValue::Bytes(vec![0xde, 0xad, 0xbe, 0xef])]
+    );
+    assert_eq!(
+        prop("spliced"),
+        &[TypedValue::Bytes(b"hello\0world\0".to_vec())]
+    );
+    assert_eq!(
+        prop("mixed"),
+        &[
+            cell(42),
+            TypedValue::String("str".into()),
+            TypedValue::Bytes(vec![0]),
+        ]
+    );
+    assert_eq!(prop("empty"), &Vec::<TypedValue>::new());
+
+    // The assigned phandle is poked into the target as a typed cell.
+    let target = typed.get_child("node@1").unwrap();
+    assert_eq!(target.get_property("phandle"), Some(&vec![cell(1)]));
+
+    // Serializing the typed tree must give exactly what `eval()` produces.
+    let mut scribe = Scribe::new(true);
+    let dts = crate::parse::parse_typed(source, &arena).unwrap();
+    let (tree, node_labels) = crate::merge::merge(dts, &mut scribe);
+    let binary = eval(tree, node_labels, &loader, &mut scribe);
+    assert!(scribe.report(&loader, &mut std::io::stderr()));
+    for (path, node) in typed.iter_preorder(NodePath::root()) {
+        let expected = binary.walk(path.segments()).unwrap();
+        for (name, values) in node.properties() {
+            assert_eq!(
+                &to_bytes(values),
+                expected.get_property(name).unwrap(),
+                "property {path}{name} serializes differently"
+            );
+        }
     }
 }
 

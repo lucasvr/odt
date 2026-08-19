@@ -10,9 +10,12 @@ pub mod parse;
 pub mod path;
 pub mod print;
 
+pub use eval::TypedValue;
+
 pub type Arena = bumpalo::Bump;
 pub type SourceNode<'i> = node::Node<&'i parse::rules::Prop<'i>>;
 pub type BinaryNode = node::Node<Vec<u8>>;
+pub type TypedNode = node::Node<Vec<TypedValue>>;
 
 /// Compile one or more DTS files into a fully-evaluated tree of binary values.
 /// `loader` resolves input paths and `/include/` or `/incbin/` directives.
@@ -38,6 +41,35 @@ pub fn compile_result(
 ) -> Result<BinaryNode, error::SourceError> {
     let mut scribe = error::Scribe::new(false);
     let r = compile(loader, dts_paths, &mut scribe);
+    scribe.collect().map(|_| r)
+}
+
+/// Compile one or more DTS files into a fully-evaluated tree of typed values.
+/// Like [`compile`], all tree merging is done and all expressions are evaluated,
+/// but each property value remains a list of [`TypedValue`]s instead of being
+/// serialized to a flat byte string.
+/// `loader` resolves input paths and `/include/` or `/incbin/` directives.
+/// `scribe` records warnings and errors encountered during compilation.
+pub fn compile_typed(
+    loader: &impl fs::Loader,
+    dts_paths: &[&std::path::Path],
+    scribe: &mut error::Scribe,
+) -> TypedNode {
+    let arena = Arena::new();
+    let dts = parse::parse_concat_with_includes(loader, &arena, dts_paths, scribe);
+    let (tree, node_labels) = merge::merge(&dts, scribe);
+    let tree = eval::resolve_incbin_paths(loader, &arena, tree, scribe);
+    eval::eval_typed(tree, node_labels, loader, scribe)
+}
+
+/// Compile one or more DTS files into a fully-evaluated tree of typed values.
+/// Only the first compilation error is reported.
+pub fn compile_typed_result(
+    loader: &impl fs::Loader,
+    dts_paths: &[&std::path::Path],
+) -> Result<TypedNode, error::SourceError> {
+    let mut scribe = error::Scribe::new(false);
+    let r = compile_typed(loader, dts_paths, &mut scribe);
     scribe.collect().map(|_| r)
 }
 
